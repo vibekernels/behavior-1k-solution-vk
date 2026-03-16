@@ -55,22 +55,25 @@ def process_episode_file(args):
     Returns ~100 KB of aggregated stats per episode (no raw chunk arrays).
     Only imports numpy and pandas — no JAX/torch/omnigibson.
     """
-    import pandas as pd  # Import inside worker to keep module-level clean
+    import pyarrow.parquet as pq  # Import inside worker to keep module-level clean
 
     (episode_file, delta_mask_arr, action_horizon,
      compute_per_timestamp, compute_correlation, sample_fraction,
      reservoir_per_episode, proprio_slices) = args
 
     try:
-        df = pd.read_parquet(episode_file, columns=["observation.state", "action"])
+        table = pq.read_table(episode_file, columns=["observation.state", "action"])
 
-        n = len(df)
+        n = len(table)
         if n == 0:
             return None
 
-        raw_states = np.stack(df["observation.state"].values)  # (N, 256)
-        raw_actions = np.stack(df["action"].values)            # (N, 23)
-        del df  # Free dataframe memory
+        # Direct pyarrow flatten+reshape — avoids pandas overhead and np.stack
+        sc = table.column("observation.state").combine_chunks()
+        raw_states = sc.values.to_numpy(zero_copy_only=False).reshape(n, -1)
+        ac = table.column("action").combine_chunks()
+        raw_actions = ac.values.to_numpy(zero_copy_only=False).reshape(n, -1)
+        del table, sc, ac
 
         # Inlined state extraction (no omnigibson import needed)
         states = _extract_state_inlined(raw_states, proprio_slices)  # (N, 23)
@@ -140,9 +143,9 @@ def process_episode_file(args):
         n_reservoir = min(reservoir_per_episode, n_samples)
         if n_reservoir < n_samples:
             res_idx = rng.choice(n_samples, size=n_reservoir, replace=False)
-            result["reservoir"] = sampled_chunks[res_idx].astype(np.float32)
+            result["reservoir"] = sampled_chunks[res_idx]
         else:
-            result["reservoir"] = sampled_chunks.astype(np.float32)
+            result["reservoir"] = sampled_chunks
 
         return result
 
@@ -282,7 +285,7 @@ def compute_correlation_from_reservoir(reservoir_arr, action_horizon, target_act
 def main(
     config_name: str,
     max_episodes: int | None = None,
-    num_workers: int = 32,
+    num_workers: int = 24,
     per_timestamp: bool = False,
     correlation: bool = True,
     sample_fraction: float = 0.1,
@@ -381,10 +384,10 @@ def main(
     pts_count = 0
     pts_sum = pts_sum_sq = pts_min = pts_max = None
 
-    # Reservoir: pre-allocated numpy array (float32 to save memory)
-    # 500K × (30, 23) × 4 bytes = 1.38 GB
+    # Reservoir: pre-allocated numpy array
+    # 500K × (30, 23) × 8 bytes = 2.76 GB
     action_dim_raw = 23  # before padding
-    reservoir_arr = np.empty((max_reservoir, action_horizon, action_dim_raw), dtype=np.float32)
+    reservoir_arr = np.empty((max_reservoir, action_horizon, action_dim_raw), dtype=np.float64)
     reservoir_filled = 0
     reservoir_seen = 0
     rng_reservoir = np.random.RandomState(42)
@@ -457,18 +460,27 @@ def main(
                     np.minimum(pts_min, result["pts_min"], out=pts_min)
                     np.maximum(pts_max, result["pts_max"], out=pts_max)
 
-            # --- Reservoir sampling (pre-allocated array, no list growth) ---
+            # --- Reservoir sampling (bulk fill, then per-item replacement) ---
             if "reservoir" in result:
                 ep_res = result["reservoir"]  # (n, H, D) float32
-                for i in range(ep_res.shape[0]):
+                n_new = ep_res.shape[0]
+
+                if reservoir_filled < max_reservoir:
+                    # Still filling: bulk copy
+                    space = max_reservoir - reservoir_filled
+                    n_direct = min(n_new, space)
+                    reservoir_arr[reservoir_filled:reservoir_filled + n_direct] = ep_res[:n_direct]
+                    reservoir_filled += n_direct
+                    reservoir_seen += n_direct
+                    ep_res = ep_res[n_direct:]  # any remainder goes to replacement
+                    n_new = ep_res.shape[0]
+
+                # Replacement sampling for remaining items (most are rejected, so loop is fast)
+                for i in range(n_new):
                     reservoir_seen += 1
-                    if reservoir_filled < max_reservoir:
-                        reservoir_arr[reservoir_filled] = ep_res[i]
-                        reservoir_filled += 1
-                    else:
-                        j = rng_reservoir.randint(0, reservoir_seen)
-                        if j < max_reservoir:
-                            reservoir_arr[j] = ep_res[i]
+                    j = rng_reservoir.randint(0, reservoir_seen)
+                    if j < max_reservoir:
+                        reservoir_arr[j] = ep_res[i]
 
             num_processed += 1
             if num_processed % 200 == 0:

@@ -7,7 +7,7 @@
 - **Baseline problem**: OOM — accumulated all raw chunk data (~110 GB) in memory before aggregation
 
 ## Key Findings from Prior Session
-- More workers helped (32 → 64 showed improvement)
+- More workers helped (32 → 64 showed improvement) for the old code
 - PyArrow column selection didn't work because `observation.state` and `action` columns contain nested arrays (object dtype)
 - The original code already had: vectorized numpy (no iterrows), column selection, sampled chunks (10%)
 
@@ -26,18 +26,32 @@
 
 ### Round 2: Memory-Safe Design (eliminated remaining OOM sources)
 - **Removed outer product from workers**: Correlation computed from reservoir at the end, not streamed. Worker results dropped from ~8.5 MB to ~100 KB each.
-- **Inlined `extract_state_from_proprio`**: Workers are pure numpy/pandas — no JAX/torch/omnigibson imports. PROPRIOCEPTION_INDICES extracted as plain dict of ints in main, passed to workers.
+- **Inlined `extract_state_from_proprio`**: Workers are pure numpy/pyarrow — no JAX/torch/omnigibson imports. PROPRIOCEPTION_INDICES extracted as plain dict of ints in main, passed to workers.
 - **`forkserver` start method**: Workers fork from a clean process, not the bloated main process with heavy imports.
-- **Pre-allocated float32 reservoir**: Single numpy array (500K × 30 × 23 × 4B = 1.38 GB max), no Python list growth.
-- **Result**: 10K episodes in 161s (62.1 eps/sec), peak memory ~3 GB. No OOM.
+- **Pre-allocated float64 reservoir**: Single numpy array (500K × 30 × 23 × 8B = 2.76 GB max), no Python list growth.
+- **Result**: 10K episodes in 161s (62.1 eps/sec), peak memory ~5 GB. No OOM.
+
+### Round 3: Read path + worker tuning
+- **PyArrow direct read**: Replaced `pd.read_parquet` + `np.stack` with `pq.read_table` + `combine_chunks().values.to_numpy().reshape()`. Avoids pandas DataFrame overhead. ~1.2x faster on hot cache reads.
+- **Batch reservoir insertion**: Bulk `memcpy` while filling, per-item replacement only after full.
+- **Worker count tuning**: forkserver startup overhead means fewer workers is better. Tested 16/24/32/48/64/96/128 workers. Sweet spot: **24 workers** (91.6 eps/sec) > 32 (88.5) > 64 (63.4) > 96 (31.4).
+- **Result**: 10K episodes in **109s** (91.6 eps/sec), peak memory ~5 GB.
+
+### Correctness Verification
+- Mean/std/per-timestamp stats: **exact match** (diff < 1e-9) between original and optimized
+- Cholesky correlation: **exact match** (diff = 0.0) when using same reservoir parameters
+- Differences only arise from different reservoir sample counts, not computation errors
 
 ## Results
 
-| Optimization | Episodes/sec | Total time (10K) | Peak memory | Kept? |
-|---|---|---|---|---|
-| Baseline (original, 32 workers) | ~3.3 | ~50 min (est.) | OOM | - |
-| Round 1: streaming stats (32 workers) | 21.8 | OOM at scale | ~110 GB+ | Replaced |
-| Round 2: memory-safe (64 workers) | **62.1** | **2.7 min** | **~3 GB** | Yes |
+| Optimization | Workers | Episodes/sec | Total time (10K) | Peak memory | Kept? |
+|---|---|---|---|---|---|
+| Baseline (original) | 32 | ~3.3 | ~50 min (est.) | OOM | - |
+| Round 1: streaming stats | 32 | 21.8 | OOM at scale | ~110 GB+ | Replaced |
+| Round 2: memory-safe | 64 | 62.1 | 2.7 min | ~5 GB | Replaced |
+| **Round 3: pyarrow + tuning** | **24** | **91.6** | **1.8 min** | **~5 GB** | **Yes** |
+
+**Overall: ~28x throughput improvement**, from ~3.3 eps/sec to 91.6 eps/sec.
 
 ## Architecture (Current)
 
@@ -46,14 +60,14 @@ Main process (heavy imports: JAX, torch, omnigibson, openpi)
   │
   ├── Extract config values, delta_mask, proprio_slices as plain Python types
   │
-  └── forkserver ProcessPoolExecutor (64 workers)
+  └── forkserver ProcessPoolExecutor (24 workers)
         │
-        Workers (only import: numpy, pandas)
-          ├── Read parquet (2 columns)
+        Workers (only import: numpy, pyarrow)
+          ├── Read parquet via pyarrow (2 columns, flatten+reshape)
           ├── Inlined state extraction (numpy slicing)
           ├── Vectorized delta transform
           ├── Compute compact stats (count/sum/sum_sq/min/max)
-          ├── Sample reservoir chunks (200 per episode, float32)
+          ├── Sample reservoir chunks (200 per episode)
           └── Return ~100 KB result dict
         │
   Main loop: accumulate stats + reservoir sampling (500K cap)
@@ -64,9 +78,3 @@ Main process (heavy imports: JAX, torch, omnigibson, openpi)
     ├── Cholesky decomposition
     └── Save norm_stats.json
 ```
-
-## Possible Further Optimizations (not yet needed)
-- Increase workers to 96-128 (currently 64, have 128 CPUs)
-- Use `pyarrow.compute` for faster parquet reads if nested array issue is resolved
-- Batch reservoir insertion instead of per-chunk loop
-- Overlap correlation computation with episode processing using a background thread
