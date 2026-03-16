@@ -2,693 +2,636 @@
 
 Computes mean, std, min, max from dataset in parallel.
 Supports per-timestamp normalization and action correlation matrices.
+
+Memory-safe design:
+  - Workers are pure numpy/pandas (no JAX/torch/omnigibson imports)
+  - Workers return only compact stats (~100 KB each), not raw arrays
+  - Correlation computed from reservoir at the end, not streamed outer products
+  - Uses forkserver to avoid inheriting parent's heavy import memory
 """
 
 import numpy as np
-import pandas as pd
-import tyro
-from pathlib import Path
-from concurrent.futures import ProcessPoolExecutor, as_completed
-import multiprocessing as mp
-
-import openpi.models.model as _model
-import openpi.transforms as transforms
-
-# Import B1K-specific modules  
-from b1k.shared import normalize
-from b1k.training import config as _config
-from b1k.policies.b1k_policy import extract_state_from_proprio
+import time
+import gc
 
 
-def get_delta_transform_from_config(config_name: str):
-    """Get the delta action transform from the config."""
-    config = _config.get_config(config_name)
-    data_config = config.data.create(config.assets_dirs, config.model)
-    
-    # Find the DeltaActions transform in the data transforms
-    delta_transform = None
-    for transform in data_config.data_transforms.inputs:
-        if isinstance(transform, transforms.DeltaActions):
-            delta_transform = transform
-            break
-    
-    if delta_transform is None:
-        raise ValueError("No DeltaActions transform found in config")
-    
-    return delta_transform
+# ============================================================
+# Worker function — pure numpy/pandas, no heavy imports.
+# Defined at module top level so it's picklable for forkserver.
+# ============================================================
+
+def _extract_state_inlined(proprio_data, proprio_slices):
+    """Inline version of extract_state_from_proprio using pre-extracted slice indices."""
+    base_qvel = proprio_data[..., proprio_slices["base_qvel_s"]:proprio_slices["base_qvel_e"]]
+    trunk_qpos = proprio_data[..., proprio_slices["trunk_qpos_s"]:proprio_slices["trunk_qpos_e"]]
+    arm_left_qpos = proprio_data[..., proprio_slices["arm_left_qpos_s"]:proprio_slices["arm_left_qpos_e"]]
+    arm_right_qpos = proprio_data[..., proprio_slices["arm_right_qpos_s"]:proprio_slices["arm_right_qpos_e"]]
+    left_gripper_raw = proprio_data[..., proprio_slices["gripper_left_qpos_s"]:proprio_slices["gripper_left_qpos_e"]].sum(axis=-1, keepdims=True)
+    right_gripper_raw = proprio_data[..., proprio_slices["gripper_right_qpos_s"]:proprio_slices["gripper_right_qpos_e"]].sum(axis=-1, keepdims=True)
+
+    MAX_GRIPPER_WIDTH = 0.1
+    left_gripper_width = 2.0 * (left_gripper_raw / MAX_GRIPPER_WIDTH) - 1.0
+    right_gripper_width = 2.0 * (right_gripper_raw / MAX_GRIPPER_WIDTH) - 1.0
+
+    return np.concatenate([
+        base_qvel, trunk_qpos, arm_left_qpos, left_gripper_width,
+        arm_right_qpos, right_gripper_width,
+    ], axis=-1)
 
 
-def apply_delta_transform_from_config(state: np.ndarray, actions: np.ndarray, mask) -> np.ndarray:
-    """Apply delta action transform using the mask from config.
-    
-    Args:
-        state: Current state (23-dim)
-        actions: Absolute actions (23-dim)
-        mask: Boolean mask from DeltaActions transform
-        
-    Returns:
-        delta_actions: Delta actions relative to current state (23-dim)
-    """
-    if mask is None:
+def _apply_delta_batch(states, actions, mask_arr):
+    """Vectorized delta transform for batched states/actions."""
+    if mask_arr is None:
         return actions
-    
-    delta_actions = actions.copy()
-    mask = np.asarray(mask)
-    dims = mask.shape[-1]
-    
-    # Apply delta transform: delta = action - state for specified dimensions
-    delta_actions[:dims] = np.where(mask, actions[:dims] - state[:dims], actions[:dims])
-    
-    return delta_actions
+    dims = mask_arr.shape[-1]
+    delta = actions.copy()
+    delta[..., :dims] = np.where(mask_arr, actions[..., :dims] - states[:, None, :dims], actions[..., :dims])
+    return delta
 
 
 def process_episode_file(args):
-    """Process a single episode file and return statistics."""
-    episode_file, delta_mask, action_horizon, compute_per_timestamp, compute_correlation, sample_fraction = args
-    
+    """Process a single episode file and return compact statistics.
+
+    Returns ~100 KB of aggregated stats per episode (no raw chunk arrays).
+    Only imports numpy and pandas — no JAX/torch/omnigibson.
+    """
+    import pandas as pd  # Import inside worker to keep module-level clean
+
+    (episode_file, delta_mask_arr, action_horizon,
+     compute_per_timestamp, compute_correlation, sample_fraction,
+     reservoir_per_episode, proprio_slices) = args
+
     try:
-        # Read parquet file directly
-        df = pd.read_parquet(episode_file)
-        
-        # Extract states and actions
-        states = []
-        raw_actions = []  # Keep raw actions for per-timestamp processing
-        actions = []
-        
-        for _, row in df.iterrows():
-            # Get raw proprioception and actions
-            raw_state = np.array(row["observation.state"])  # 256-dim
-            raw_action = np.array(row["action"])            # 23-dim
-            
-            # Apply state extraction (same as training/inference)
-            processed_state = extract_state_from_proprio(raw_state)  # 23-dim
-            
-            # Apply delta transform to actions (for regular statistics)
-            delta_action = apply_delta_transform_from_config(processed_state, raw_action, delta_mask)
-            
-            states.append(processed_state)
-            raw_actions.append(raw_action)
-            actions.append(delta_action)
-        
-        if len(states) == 0:
-            return None, None
-            
-        states = np.array(states)
-        raw_actions = np.array(raw_actions)
-        actions = np.array(actions)
-        
-        # Compute episode statistics (including min/max which we'll use instead of quantiles)
-        episode_stats = {
-            "state": {
-                "count": len(states),
-                "sum": np.sum(states, axis=0),
-                "sum_sq": np.sum(states**2, axis=0),
-                "min": np.min(states, axis=0),
-                "max": np.max(states, axis=0),
-            },
-            "actions": {
-                "count": len(actions),
-                "sum": np.sum(actions, axis=0),
-                "sum_sq": np.sum(actions**2, axis=0),
-                "min": np.min(actions, axis=0),
-                "max": np.max(actions, axis=0),
-            }
+        df = pd.read_parquet(episode_file, columns=["observation.state", "action"])
+
+        n = len(df)
+        if n == 0:
+            return None
+
+        raw_states = np.stack(df["observation.state"].values)  # (N, 256)
+        raw_actions = np.stack(df["action"].values)            # (N, 23)
+        del df  # Free dataframe memory
+
+        # Inlined state extraction (no omnigibson import needed)
+        states = _extract_state_inlined(raw_states, proprio_slices)  # (N, 23)
+        del raw_states
+
+        # Per-step delta transform
+        if delta_mask_arr is not None:
+            dims = delta_mask_arr.shape[-1]
+            actions = raw_actions.copy()
+            actions[..., :dims] = np.where(
+                delta_mask_arr,
+                raw_actions[..., :dims] - states[..., :dims],
+                raw_actions[..., :dims]
+            )
+        else:
+            actions = raw_actions
+
+        # Compact episode-level stats
+        result = {
+            "state_count": n,
+            "state_sum": np.sum(states, axis=0),
+            "state_sum_sq": np.sum(states**2, axis=0),
+            "state_min": np.min(states, axis=0),
+            "state_max": np.max(states, axis=0),
+            "action_count": n,
+            "action_sum": np.sum(actions, axis=0),
+            "action_sum_sq": np.sum(actions**2, axis=0),
+            "action_min": np.min(actions, axis=0),
+            "action_max": np.max(actions, axis=0),
         }
-        
-        # Compute per-timestamp statistics and action chunks if requested
-        per_timestamp_data = None
-        correlation_chunks = None
-        if compute_per_timestamp or compute_correlation:
-            # Create action chunks for per-timestamp statistics
-            # For each timestep, take the current state and next action_horizon absolute actions
-            action_chunks = []
-            for i in range(len(states) - action_horizon + 1):
-                current_state = states[i]  # State at time i
-                # Take next action_horizon absolute actions starting from time i
-                future_absolute_actions = raw_actions[i:i + action_horizon]  # Shape: (action_horizon, action_dim)
-                
-                # Apply delta transform to each action using the SAME current state
-                delta_chunk = np.zeros_like(future_absolute_actions)
-                for t in range(action_horizon):
-                    delta_chunk[t] = apply_delta_transform_from_config(current_state, future_absolute_actions[t], delta_mask)
-                
-                action_chunks.append(delta_chunk)
-            
-            if action_chunks:
-                action_chunks = np.array(action_chunks)  # Shape: (num_chunks, action_horizon, action_dim)
-                
-                # Sample chunks (not individual actions!) to reduce memory usage
-                # Use fixed seed per episode for reproducibility
-                rng = np.random.RandomState(hash(str(episode_file)) % (2**31))
-                n_chunk_samples = max(1, int(len(action_chunks) * sample_fraction))
-                
-                if sample_fraction < 1.0 and n_chunk_samples < len(action_chunks):
-                    chunk_indices = rng.choice(len(action_chunks), size=n_chunk_samples, replace=False)
-                    sampled_chunks = action_chunks[chunk_indices]
-                else:
-                    sampled_chunks = action_chunks
-                
-                if compute_per_timestamp:
-                    per_timestamp_data = sampled_chunks
-                if compute_correlation:
-                    correlation_chunks = sampled_chunks
-        
-        # Don't return full states/actions to save memory - we have everything we need in episode_stats
-        return episode_stats, (per_timestamp_data, correlation_chunks)
-        
+
+        # Build action chunks if needed
+        if not (compute_per_timestamp or compute_correlation):
+            return result
+
+        num_chunks = n - action_horizon + 1
+        if num_chunks <= 0:
+            return result
+
+        # Sample chunk indices
+        rng = np.random.RandomState(hash(str(episode_file)) % (2**31))
+        n_chunk_samples = max(1, int(num_chunks * sample_fraction))
+
+        if sample_fraction < 1.0 and n_chunk_samples < num_chunks:
+            chunk_indices = rng.choice(num_chunks, size=n_chunk_samples, replace=False)
+        else:
+            chunk_indices = np.arange(num_chunks)
+
+        # Build sampled chunks using vectorized stride indexing
+        window_offsets = np.arange(action_horizon)
+        gather_indices = chunk_indices[:, None] + window_offsets[None, :]
+        action_windows = raw_actions[gather_indices]  # (n_samples, H, D)
+        chunk_states = states[chunk_indices]
+
+        sampled_chunks = _apply_delta_batch(chunk_states, action_windows, delta_mask_arr)
+        n_samples = sampled_chunks.shape[0]
+
+        # Per-timestamp compact stats (tiny: H×D arrays)
+        if compute_per_timestamp:
+            result["pts_count"] = n_samples
+            result["pts_sum"] = np.sum(sampled_chunks, axis=0)
+            result["pts_sum_sq"] = np.sum(sampled_chunks**2, axis=0)
+            result["pts_min"] = np.min(sampled_chunks, axis=0)
+            result["pts_max"] = np.max(sampled_chunks, axis=0)
+
+        # Reservoir sample for quantile + correlation computation
+        n_reservoir = min(reservoir_per_episode, n_samples)
+        if n_reservoir < n_samples:
+            res_idx = rng.choice(n_samples, size=n_reservoir, replace=False)
+            result["reservoir"] = sampled_chunks[res_idx].astype(np.float32)
+        else:
+            result["reservoir"] = sampled_chunks.astype(np.float32)
+
+        return result
+
     except Exception as e:
         print(f"Error processing {episode_file}: {e}")
-        return None, None
+        import traceback
+        traceback.print_exc()
+        return None
 
 
-def aggregate_episode_stats(episode_stats_list, all_data_list, config, compute_correlation=False, max_correlation_samples=2000000, compute_quantiles_sample_size=1000000):
-    """Aggregate statistics from multiple episodes."""
-    
-    # Collect per-timestamp data if available
-    per_timestamp_chunks = []
-    for data in all_data_list:
-        if data is not None and len(data) > 0 and data[0] is not None:
-            per_timestamp_chunks.append(data[0])
-    
-    # Collect correlation chunks if available
-    correlation_chunks = []
-    for data in all_data_list:
-        if data is not None and len(data) > 1 and data[1] is not None:
-            correlation_chunks.append(data[1])
-    
-    # Collect raw data for quantile computation (sample if too large)
-    state_data_for_quantiles = []
-    action_data_for_quantiles = []
-    
-    for data in all_data_list:
-        if data is not None and len(data) > 0 and data[0] is not None:
-            # data[0] is per_timestamp chunks: [N, H, D]
-            chunks = data[0]
-            # For actions, we have action chunks
-            # For states, we would need separate collection (skip for now, use min/max)
-            action_data_for_quantiles.append(chunks)
-    
-    # Aggregate counts, sums, etc.
-    final_stats = {"state": {}, "actions": {}}
-    
-    for key in ["state", "actions"]:
-        total_count = sum(stats[key]["count"] for stats in episode_stats_list if stats is not None)
-        total_sum = np.sum([stats[key]["sum"] for stats in episode_stats_list if stats is not None], axis=0)
-        total_sum_sq = np.sum([stats[key]["sum_sq"] for stats in episode_stats_list if stats is not None], axis=0)
-        global_min = np.min([stats[key]["min"] for stats in episode_stats_list if stats is not None], axis=0)
-        global_max = np.max([stats[key]["max"] for stats in episode_stats_list if stats is not None], axis=0)
-        
-        # Compute final statistics
-        mean = total_sum / total_count
-        variance = (total_sum_sq / total_count) - mean**2
-        std = np.sqrt(np.maximum(0, variance))
-        
-        # Compute actual percentiles for actions (sample if needed for memory efficiency)
-        if key == "actions" and action_data_for_quantiles:
-            print(f"Computing actual percentiles for actions...")
-            # Concatenate all action chunks and flatten to [N*H, D]
-            all_action_data = np.vstack(action_data_for_quantiles)  # [N, H, D]
-            all_action_data_flat = all_action_data.reshape(-1, all_action_data.shape[-1])  # [N*H, D]
-            
-            # Sample if too large for memory
-            if len(all_action_data_flat) > compute_quantiles_sample_size:
-                print(f"  Sampling {compute_quantiles_sample_size:,} from {len(all_action_data_flat):,} data points")
-                rng = np.random.RandomState(42)
-                indices = rng.choice(len(all_action_data_flat), size=compute_quantiles_sample_size, replace=False)
-                all_action_data_flat = all_action_data_flat[indices]
-            
-            q01 = np.percentile(all_action_data_flat, 1, axis=0)
-            q99 = np.percentile(all_action_data_flat, 99, axis=0)
-            print(f"  Computed q01/q99 from {len(all_action_data_flat):,} samples")
-        else:
-            # Fallback to min/max for state (no chunks collected)
-            q01 = global_min
-            q99 = global_max
-        
-        final_stats[key] = {
-            "mean": mean,
-            "std": std,
-            "q01": q01,
-            "q99": q99,
-        }
-    
-    # Compute per-timestamp statistics for actions if available
-    per_timestamp_stats = None
-    if per_timestamp_chunks and key == "actions":
-        # Combine all chunks: (num_episodes * num_chunks_per_episode, action_horizon, action_dim)
-        all_chunks = np.vstack(per_timestamp_chunks)
-        
-        # Compute statistics for each timestamp
-        action_horizon, action_dim = all_chunks.shape[1], all_chunks.shape[2]
-        per_timestamp_mean = np.zeros((action_horizon, action_dim))
-        per_timestamp_std = np.zeros((action_horizon, action_dim))
-        per_timestamp_q01 = np.zeros((action_horizon, action_dim))
-        per_timestamp_q99 = np.zeros((action_horizon, action_dim))
-        
-        for t in range(action_horizon):
-            timestep_data = all_chunks[:, t, :]  # Shape: (num_chunks, action_dim)
-            per_timestamp_mean[t] = np.mean(timestep_data, axis=0)
-            per_timestamp_std[t] = np.std(timestep_data, axis=0)
-            per_timestamp_q01[t] = np.percentile(timestep_data, 1, axis=0)
-            per_timestamp_q99[t] = np.percentile(timestep_data, 99, axis=0)
-        
-        per_timestamp_stats = {
-            "per_timestamp_mean": per_timestamp_mean,
-            "per_timestamp_std": per_timestamp_std,
-            "per_timestamp_q01": per_timestamp_q01,
-            "per_timestamp_q99": per_timestamp_q99,
-        }
-    
-    # Compute full correlation matrix for actions if available
-    correlation_stats = None
-    if compute_correlation and not correlation_chunks:
-        raise RuntimeError(
-            "Correlation computation was requested but no correlation chunks were collected. "
-            "This indicates an issue with episode processing or insufficient data."
-        )
-    
-    if correlation_chunks:
-        print("Computing full action correlation matrix...")
-        # Combine all chunks: (num_episodes * num_chunks_per_episode, action_horizon, action_dim)
-        all_corr_chunks = np.vstack(correlation_chunks)
-        action_horizon, action_dim = all_corr_chunks.shape[1], all_corr_chunks.shape[2]
-        target_action_dim = config.model.action_dim  # 32 (with padding)
-        
-        print(f"Total action chunks available: {all_corr_chunks.shape[0]} of shape ({action_horizon}, {action_dim})")
-        
-        # PAD action dimensions BEFORE computing correlations
-        if action_dim < target_action_dim:
-            print(f"Padding actions from {action_dim}D to {target_action_dim}D...")
-            # Pad with zeros: (num_samples, action_horizon, action_dim) -> (num_samples, action_horizon, target_action_dim)
-            padding = np.zeros((all_corr_chunks.shape[0], action_horizon, target_action_dim - action_dim))
-            all_corr_chunks_padded = np.concatenate([all_corr_chunks, padding], axis=2)
-            print(f"Padded chunks shape: {all_corr_chunks_padded.shape}")
-        else:
-            all_corr_chunks_padded = all_corr_chunks[:, :, :target_action_dim]
-        
-        # Flatten chunks to (num_samples, action_horizon * target_action_dim)
-        flattened_chunks = all_corr_chunks_padded.reshape(-1, action_horizon * target_action_dim)
-        total_samples = flattened_chunks.shape[0]
-        
-        # Subsample if we have too many samples (for computational efficiency)
-        if total_samples > max_correlation_samples:
-            print(f"Subsampling {max_correlation_samples} random chunks for correlation computation (from {total_samples})")
-            print(f"This provides ~{100 * max_correlation_samples / total_samples:.1f}x speedup with negligible accuracy loss")
-            rng = np.random.RandomState(42)  # Fixed seed for reproducibility
-            sample_indices = rng.choice(total_samples, size=max_correlation_samples, replace=False)
-            flattened_chunks = flattened_chunks[sample_indices]
-            print(f"Using {flattened_chunks.shape[0]} sampled chunks for correlation matrix computation")
-        else:
-            print(f"Using all {total_samples} chunks (no subsampling needed)")
-        
-        # Normalize each dimension to zero mean and unit variance for correlation computation
-        # This ensures the correlation matrix captures pure correlation structure
-        chunk_mean = np.mean(flattened_chunks, axis=0)
-        chunk_std = np.std(flattened_chunks, axis=0)
-        
-        # Identify constant dimensions (std ≈ 0, including padded dimensions)
-        constant_dims = chunk_std < 1e-6
-        print(f"Found {np.sum(constant_dims)} constant/padded dimensions (will be set to identity)")
-        
-        # Normalize non-constant dimensions
-        normalized_chunks = flattened_chunks.copy()
-        normalized_chunks[:, ~constant_dims] = (flattened_chunks[:, ~constant_dims] - chunk_mean[~constant_dims]) / chunk_std[~constant_dims]
-        # Constant dimensions stay as 0 (already centered at 0 due to padding)
-        
-        # Compute empirical covariance matrix
-        # For normalized data, covariance = correlation
-        cov_matrix = np.cov(normalized_chunks, rowvar=False)  # Shape: [H*D, H*D]
-        print(f"Covariance matrix shape: {cov_matrix.shape}")
-        
-        # Enforce diagonal = 1 for all dimensions (standard correlation matrix property)
-        # Handle constant dimensions carefully (avoid division by zero)
-        diag_vals = np.diag(cov_matrix).copy()
-        print(f"Diagonal before correction: min={np.min(diag_vals):.6f}, max={np.max(diag_vals):.6f}")
-        
-        # Identify truly constant dimensions (diagonal ≈ 0)
-        constant_mask = diag_vals < 1e-10
-        num_constant = np.sum(constant_mask)
-        print(f"Found {num_constant} dimensions with zero variance on diagonal")
-        
-        # Normalize correlation matrix (avoid division by zero)
-        diag_vals_safe = diag_vals.copy()
-        diag_vals_safe[constant_mask] = 1.0  # Prevent division by zero
-        
-        normalizer = np.sqrt(diag_vals_safe[:, None] @ diag_vals_safe[None, :])
-        cov_matrix = cov_matrix / normalizer
-        
-        # For constant dimensions: set their rows/columns to 0, diagonal to 1
-        cov_matrix[constant_mask, :] = 0.0
-        cov_matrix[:, constant_mask] = 0.0
-        np.fill_diagonal(cov_matrix, 1.0)
-        
-        print(f"Diagonal after correction: min={np.min(np.diag(cov_matrix)):.6f}, max={np.max(np.diag(cov_matrix)):.6f}")
-        print(f"Matrix check: has NaN={np.any(np.isnan(cov_matrix))}, has Inf={np.any(np.isinf(cov_matrix))}")
-        
-        # Add regularization for numerical stability
-        epsilon = 1e-6
-        cov_matrix_reg = cov_matrix + epsilon * np.eye(cov_matrix.shape[0])
-        
-        # Check eigenvalues for positive definiteness
+# ============================================================
+# Correlation computation from reservoir (main process only)
+# ============================================================
+
+def compute_correlation_from_reservoir(reservoir_arr, action_horizon, target_action_dim,
+                                        max_correlation_samples=2_000_000):
+    """Compute correlation matrix, Cholesky, spatial and temporal averages from reservoir samples."""
+    action_dim = reservoir_arr.shape[-1]  # 23
+    n_total = reservoir_arr.shape[0]
+
+    # Pad to target_action_dim
+    if action_dim < target_action_dim:
+        padding = np.zeros((n_total, action_horizon, target_action_dim - action_dim), dtype=reservoir_arr.dtype)
+        padded = np.concatenate([reservoir_arr, padding], axis=2)
+    else:
+        padded = reservoir_arr[:, :, :target_action_dim]
+
+    F = action_horizon * target_action_dim
+    flat = padded.reshape(n_total, F).astype(np.float64)
+    del padded
+
+    # Subsample if too many
+    if n_total > max_correlation_samples:
+        print(f"Subsampling {max_correlation_samples:,} from {n_total:,} for correlation")
+        rng = np.random.RandomState(42)
+        idx = rng.choice(n_total, size=max_correlation_samples, replace=False)
+        flat = flat[idx]
+        print(f"Using {flat.shape[0]:,} samples")
+    else:
+        print(f"Using all {n_total:,} samples")
+
+    # Compute mean, std, covariance
+    chunk_mean = np.mean(flat, axis=0)
+    chunk_std = np.std(flat, axis=0)
+
+    constant_dims = chunk_std < 1e-6
+    print(f"Found {np.sum(constant_dims)} constant/padded dimensions (will be set to identity)")
+
+    # Normalize non-constant dims
+    normalized = flat.copy()
+    normalized[:, ~constant_dims] = (flat[:, ~constant_dims] - chunk_mean[~constant_dims]) / chunk_std[~constant_dims]
+    del flat
+
+    # Compute covariance = correlation (since data is normalized)
+    cov_matrix = (normalized.T @ normalized) / normalized.shape[0]
+    # Correct for mean (should be ~0 after normalization, but be precise)
+    norm_mean = np.mean(normalized, axis=0)
+    cov_matrix -= np.outer(norm_mean, norm_mean)
+
+    # Clean up constant dims
+    cov_matrix[constant_dims, :] = 0.0
+    cov_matrix[:, constant_dims] = 0.0
+    np.fill_diagonal(cov_matrix, 1.0)
+
+    print(f"Correlation matrix shape: {cov_matrix.shape}")
+    print(f"Diagonal: min={np.min(np.diag(cov_matrix)):.6f}, max={np.max(np.diag(cov_matrix)):.6f}")
+    print(f"Matrix check: has NaN={np.any(np.isnan(cov_matrix))}, has Inf={np.any(np.isinf(cov_matrix))}")
+
+    # Regularization
+    epsilon = 1e-6
+    cov_matrix_reg = cov_matrix + epsilon * np.eye(F)
+
+    eigenvalues = np.linalg.eigvalsh(cov_matrix_reg)
+    min_eigenvalue = np.min(eigenvalues)
+    print(f"Min eigenvalue after regularization: {min_eigenvalue:.6e}")
+
+    if min_eigenvalue <= 0:
+        print(f"WARNING: Not positive definite! Adding stronger regularization...")
+        epsilon = max(1e-5, -min_eigenvalue + 1e-5)
+        cov_matrix_reg = cov_matrix + epsilon * np.eye(F)
         eigenvalues = np.linalg.eigvalsh(cov_matrix_reg)
-        min_eigenvalue = np.min(eigenvalues)
-        print(f"Min eigenvalue after regularization: {min_eigenvalue:.6e}")
-        
-        if min_eigenvalue <= 0:
-            print(f"WARNING: Matrix not positive definite! Adding stronger regularization...")
-            # Add stronger regularization if needed
-            epsilon = max(1e-5, -min_eigenvalue + 1e-5)
-            cov_matrix_reg = cov_matrix + epsilon * np.eye(cov_matrix.shape[0])
-            eigenvalues = np.linalg.eigvalsh(cov_matrix_reg)
-            min_eigenvalue = np.min(eigenvalues)
-            print(f"New min eigenvalue: {min_eigenvalue:.6e}")
-        
-        # Compute Cholesky decomposition
-        try:
-            chol_lower = np.linalg.cholesky(cov_matrix_reg)
-            print(f"Cholesky decomposition successful! Shape: {chol_lower.shape}")
-            
-            # Verify reconstruction: L @ L.T ≈ Σ
-            reconstructed = chol_lower @ chol_lower.T
-            reconstruction_error = np.linalg.norm(reconstructed - cov_matrix_reg, 'fro') / np.linalg.norm(cov_matrix_reg, 'fro')
-            print(f"Cholesky reconstruction error: {reconstruction_error:.6e}")
-            
-            # Compute averaged spatial correlation (dim × dim)
-            # Average correlation across all timesteps
-            print("\nComputing averaged spatial correlation (dim × dim)...")
-            spatial_corrs = []
-            for t in range(action_horizon):
-                start_idx = t * target_action_dim
-                end_idx = (t + 1) * target_action_dim
-                timestep_data = normalized_chunks[:, start_idx:end_idx]
-                corr_t = np.cov(timestep_data, rowvar=False)
-                
-                # Normalize to ensure diagonal = 1
-                diag_t = np.diag(corr_t)
-                corr_t = corr_t / np.sqrt(diag_t[:, None] @ diag_t[None, :])
-                
-                spatial_corrs.append(corr_t)
-            
-            avg_spatial_corr = np.mean(spatial_corrs, axis=0)  # (target_action_dim, target_action_dim)
-            # Final diagonal enforcement
-            np.fill_diagonal(avg_spatial_corr, 1.0)
-            print(f"Averaged spatial correlation shape: {avg_spatial_corr.shape}")
-            
-            # Compute averaged temporal correlation (time × time)
-            # Average correlation across all NON-CONSTANT dimensions only
-            print("Computing averaged temporal correlation (time × time)...")
-            temporal_corrs = []
-            
-            # Identify which dimensions are constant (per original dimension, before flattening)
-            dim_is_constant = []
-            for d in range(target_action_dim):
-                # Check if this dimension is constant across all timesteps
-                dim_indices_check = [t * target_action_dim + d for t in range(action_horizon)]
-                dim_std = chunk_std[dim_indices_check]
-                # Dimension is constant if std < 1e-6 for all its timesteps
-                dim_is_constant.append(np.all(dim_std < 1e-6))
-            
-            num_constant = np.sum(dim_is_constant)
-            print(f"  Excluding {num_constant} constant dimensions from temporal averaging")
-            
-            for d in range(target_action_dim):
-                if dim_is_constant[d]:
-                    continue  # Skip constant dimensions
-                    
-                dim_indices = [t * target_action_dim + d for t in range(action_horizon)]
-                dim_data = normalized_chunks[:, dim_indices]
-                corr_d = np.cov(dim_data, rowvar=False)
-                
-                # Normalize to ensure diagonal = 1
-                diag_d = np.diag(corr_d)
-                corr_d = corr_d / np.sqrt(diag_d[:, None] @ diag_d[None, :])
-                
-                temporal_corrs.append(corr_d)
-            
-            if len(temporal_corrs) > 0:
-                avg_temporal_corr = np.mean(temporal_corrs, axis=0)  # (action_horizon, action_horizon)
-                # Final diagonal enforcement
-                np.fill_diagonal(avg_temporal_corr, 1.0)
-                print(f"Averaged temporal correlation shape: {avg_temporal_corr.shape}")
-            else:
-                # All dimensions are constant - use identity
-                avg_temporal_corr = np.eye(action_horizon)
-                print(f"All dimensions constant - using identity for temporal correlation")
-            
-            # Store correlation matrices
-            # Beta shrinkage will be applied at model load time
-            correlation_stats = {
-                "action_correlation_cholesky": chol_lower,
-                "action_correlation_spatial": avg_spatial_corr,    # (D, D) - averaged spatial
-                "action_correlation_temporal": avg_temporal_corr,  # (H, H) - averaged temporal
-            }
-        except np.linalg.LinAlgError as e:
-            raise RuntimeError(
-                f"Cholesky decomposition failed: {e}. "
-                "This indicates the covariance matrix is not positive definite even after regularization. "
-                "This is a critical error that needs investigation."
-            )
-    
-    return final_stats, per_timestamp_stats, correlation_stats
+        print(f"New min eigenvalue: {np.min(eigenvalues):.6e}")
 
+    # Cholesky
+    chol_lower = np.linalg.cholesky(cov_matrix_reg)
+    print(f"Cholesky decomposition successful! Shape: {chol_lower.shape}")
+
+    reconstructed = chol_lower @ chol_lower.T
+    err = np.linalg.norm(reconstructed - cov_matrix_reg, 'fro') / np.linalg.norm(cov_matrix_reg, 'fro')
+    print(f"Cholesky reconstruction error: {err:.6e}")
+
+    # Averaged spatial correlation (dim × dim)
+    print("\nComputing averaged spatial correlation (dim × dim)...")
+    spatial_corrs = []
+    for t in range(action_horizon):
+        s, e = t * target_action_dim, (t + 1) * target_action_dim
+        spatial_corrs.append(cov_matrix[s:e, s:e])
+    avg_spatial_corr = np.mean(spatial_corrs, axis=0)
+    np.fill_diagonal(avg_spatial_corr, 1.0)
+    print(f"Averaged spatial correlation shape: {avg_spatial_corr.shape}")
+
+    # Averaged temporal correlation (time × time)
+    print("Computing averaged temporal correlation (time × time)...")
+    dim_is_constant = [np.all(chunk_std[[t * target_action_dim + d for t in range(action_horizon)]] < 1e-6)
+                       for d in range(target_action_dim)]
+    num_const = sum(dim_is_constant)
+    print(f"  Excluding {num_const} constant dimensions from temporal averaging")
+
+    temporal_corrs = []
+    for d in range(target_action_dim):
+        if dim_is_constant[d]:
+            continue
+        dim_indices = [t * target_action_dim + d for t in range(action_horizon)]
+        temporal_corrs.append(cov_matrix[np.ix_(dim_indices, dim_indices)])
+
+    if temporal_corrs:
+        avg_temporal_corr = np.mean(temporal_corrs, axis=0)
+        np.fill_diagonal(avg_temporal_corr, 1.0)
+        print(f"Averaged temporal correlation shape: {avg_temporal_corr.shape}")
+    else:
+        avg_temporal_corr = np.eye(action_horizon)
+
+    del normalized, cov_matrix, cov_matrix_reg
+    gc.collect()
+
+    return {
+        "action_correlation_cholesky": chol_lower,
+        "action_correlation_spatial": avg_spatial_corr,
+        "action_correlation_temporal": avg_temporal_corr,
+    }
+
+
+# ============================================================
+# Main — only place that imports heavy modules
+# ============================================================
 
 def main(
-    config_name: str, 
-    max_episodes: int | None = None, 
-    num_workers: int | None = None, 
-    per_timestamp: bool = False, 
+    config_name: str,
+    max_episodes: int | None = None,
+    num_workers: int = 32,
+    per_timestamp: bool = False,
     correlation: bool = True,
-    max_correlation_samples: int = 2000000,
-    sample_fraction: float = 0.1
+    sample_fraction: float = 0.1,
+    reservoir_per_episode: int = 200,
+    max_reservoir: int = 500_000,
+    max_correlation_samples: int = 2_000_000,
 ):
-    """Compute normalization statistics quickly for B1K config using parallel processing.
-    
+    """Compute normalization statistics for B1K config using parallel processing.
+
     Args:
         config_name: Name of the training config
         max_episodes: Maximum number of episodes to process (None = all)
-        num_workers: Number of parallel workers (None = auto)
+        num_workers: Number of parallel workers
         per_timestamp: Whether to compute per-timestamp statistics
         correlation: Whether to compute action correlation matrix
-        max_correlation_samples: Maximum number of samples to use for correlation computation
-                                  (subsampling for efficiency, 2M is typically sufficient)
-        sample_fraction: Fraction of action chunks to sample from each episode for 
-                        correlation/per-timestamp stats (default 0.1 = 10%, use 1.0 for no sampling).
-                        Note: mean/std/min/max are ALWAYS computed over ALL data.
+        sample_fraction: Fraction of action chunks to sample per episode (0.1 = 10%).
+        reservoir_per_episode: Chunk samples kept per episode for quantile/correlation.
+        max_reservoir: Maximum total reservoir size for quantile/correlation computation.
+        max_correlation_samples: Max samples for correlation matrix computation.
     """
-    
+    import multiprocessing as mp
+    from concurrent.futures import ProcessPoolExecutor, as_completed
+    from pathlib import Path
+    import tyro
+
+    # Heavy imports — only in main process
+    import openpi.transforms as transforms
+    from b1k.shared import normalize
+    from b1k.training import config as _config
+    from omnigibson.learning.utils.eval_utils import PROPRIOCEPTION_INDICES
+
+    t_start = time.time()
+
     config = _config.get_config(config_name)
     data_config = config.data.create(config.assets_dirs, config.model)
-    
+
     if not data_config.behavior_dataset_root:
         raise ValueError("This script only works with B1K behavior datasets")
-    
-    # Get the delta transform from config
-    delta_transform = get_delta_transform_from_config(config_name)
-    print(f"Using delta transform with mask: {delta_transform.mask}")
-    
-    # Check if we should compute per-timestamp stats
+
+    # Get delta transform mask
+    delta_mask = None
+    for transform in data_config.data_transforms.inputs:
+        if isinstance(transform, transforms.DeltaActions):
+            delta_mask = transform.mask
+            break
+    if delta_mask is None:
+        raise ValueError("No DeltaActions transform found in config")
+    print(f"Using delta transform with mask: {delta_mask}")
+    delta_mask_arr = np.asarray(delta_mask)
+
+    # Extract PROPRIOCEPTION_INDICES as plain dict of ints (serializable, no omnigibson needed in workers)
+    idx = PROPRIOCEPTION_INDICES["R1Pro"]
+    proprio_slices = {
+        "base_qvel_s": idx["base_qvel"].start, "base_qvel_e": idx["base_qvel"].stop,
+        "trunk_qpos_s": idx["trunk_qpos"].start, "trunk_qpos_e": idx["trunk_qpos"].stop,
+        "arm_left_qpos_s": idx["arm_left_qpos"].start, "arm_left_qpos_e": idx["arm_left_qpos"].stop,
+        "arm_right_qpos_s": idx["arm_right_qpos"].start, "arm_right_qpos_e": idx["arm_right_qpos"].stop,
+        "gripper_left_qpos_s": idx["gripper_left_qpos"].start, "gripper_left_qpos_e": idx["gripper_left_qpos"].stop,
+        "gripper_right_qpos_s": idx["gripper_right_qpos"].start, "gripper_right_qpos_e": idx["gripper_right_qpos"].stop,
+    }
+
     compute_per_timestamp = per_timestamp or data_config.use_per_timestamp_norm
     compute_correlation = correlation
     action_horizon = config.model.action_horizon
-    
+    target_action_dim = config.model.action_dim
+
     if compute_per_timestamp:
         print(f"Computing per-timestamp statistics with action_horizon={action_horizon}")
-    
     if compute_correlation:
-        print(f"Computing correlation matrix for action chunks with action_horizon={action_horizon}")
-    
-    # Print sampling information
-    print(f"Memory-efficient mode: Using min/max instead of quantiles (q01/q99)")
+        print(f"Computing correlation matrix with action_horizon={action_horizon}")
     if sample_fraction < 1.0:
-        print(f"Sampling {sample_fraction*100:.0f}% of action chunks from each episode for correlation/per-timestamp stats")
-    else:
-        print(f"Using all action chunks (no sampling) - this may cause OOM on large datasets")
-    
-    # Find all episode parquet files
+        print(f"Sampling {sample_fraction*100:.0f}% of action chunks per episode")
+
+    # Find episode files
     data_root = Path(data_config.behavior_dataset_root)
-    print(f"Looking for episode files in: {data_root}/data/task-*/episode_*.parquet")
-    
-    episode_files = list(data_root.glob("data/task-*/episode_*.parquet"))
-    print(f"Found {len(episode_files)} total episode files")
-    
+    episode_files = sorted(data_root.glob("data/task-*/episode_*.parquet"))
+    print(f"Found {len(episode_files)} episode files")
+
     if max_episodes is not None:
         episode_files = episode_files[:max_episodes]
-        print(f"Limited to {len(episode_files)} files based on max_episodes")
-    
-    if len(episode_files) == 0:
-        print("No episode files found! Checking directory structure...")
-        print(f"Contents of {data_root}:")
-        for item in data_root.iterdir():
-            print(f"  {item}")
-        if (data_root / "data").exists():
-            print(f"Contents of {data_root}/data:")
-            for item in (data_root / "data").iterdir():
-                print(f"  {item}")
+        print(f"Limited to {len(episode_files)} files")
+
+    if not episode_files:
         raise ValueError("No episode files found")
-    
-    print(f"Processing {len(episode_files)} episode files...")
-    
-    # Set up parallel processing
-    if num_workers is None:
-        num_workers = min(mp.cpu_count(), len(episode_files))
-    
-    # Ensure at least 1 worker
-    num_workers = max(1, num_workers)
-    print(f"Using {num_workers} workers")
-    
-    # Process episodes in parallel
-    episode_stats_list = []
-    all_data_list = []
-    
-    with ProcessPoolExecutor(max_workers=num_workers) as executor:
-        # Submit all jobs
+
+    num_workers = max(1, min(num_workers, len(episode_files)))
+    print(f"Using {num_workers} workers (forkserver)")
+
+    # ====== Streaming accumulators ======
+    total_state_count = 0
+    state_sum = state_sum_sq = state_min = state_max = None
+
+    total_action_count = 0
+    action_sum = action_sum_sq = action_min = action_max = None
+
+    pts_count = 0
+    pts_sum = pts_sum_sq = pts_min = pts_max = None
+
+    # Reservoir: pre-allocated numpy array (float32 to save memory)
+    # 500K × (30, 23) × 4 bytes = 1.38 GB
+    action_dim_raw = 23  # before padding
+    reservoir_arr = np.empty((max_reservoir, action_horizon, action_dim_raw), dtype=np.float32)
+    reservoir_filled = 0
+    reservoir_seen = 0
+    rng_reservoir = np.random.RandomState(42)
+
+    num_processed = 0
+    t_processing_start = time.time()
+
+    # Use forkserver to avoid inheriting parent's JAX/torch memory
+    ctx = mp.get_context("forkserver")
+
+    with ProcessPoolExecutor(max_workers=num_workers, mp_context=ctx) as executor:
         future_to_file = {
-            executor.submit(process_episode_file, (episode_file, delta_transform.mask, action_horizon, compute_per_timestamp, compute_correlation, sample_fraction)): episode_file 
-            for episode_file in episode_files
+            executor.submit(
+                process_episode_file,
+                (str(ep), delta_mask_arr, action_horizon,
+                 compute_per_timestamp, compute_correlation, sample_fraction,
+                 reservoir_per_episode, proprio_slices)
+            ): ep
+            for ep in episode_files
         }
-        
-        # Collect results
+
         for future in as_completed(future_to_file):
-            episode_file = future_to_file[future]
             try:
-                episode_stats, episode_data = future.result()
-                if episode_stats is not None:
-                    episode_stats_list.append(episode_stats)
-                    all_data_list.append(episode_data)
-                    
-                if len(episode_stats_list) % 10 == 0:
-                    print(f"Processed {len(episode_stats_list)} episodes...")
-                    
+                result = future.result()
             except Exception as e:
-                print(f"Error processing {episode_file}: {e}")
-    
-    print(f"Successfully processed {len(episode_stats_list)} episodes")
-    
-    # Aggregate all statistics
-    print("Aggregating statistics...")
-    final_stats, per_timestamp_stats, correlation_stats = aggregate_episode_stats(
-        episode_stats_list, all_data_list, 
-        config,
-        compute_correlation=compute_correlation,
-        max_correlation_samples=max_correlation_samples
-    )
-    
-    # Prepare correlation matrix if computed
+                ep = future_to_file[future]
+                print(f"Error processing {ep}: {e}")
+                continue
+
+            if result is None:
+                continue
+
+            # --- State stats ---
+            total_state_count += result["state_count"]
+            if state_sum is None:
+                state_sum = result["state_sum"].copy()
+                state_sum_sq = result["state_sum_sq"].copy()
+                state_min = result["state_min"].copy()
+                state_max = result["state_max"].copy()
+            else:
+                state_sum += result["state_sum"]
+                state_sum_sq += result["state_sum_sq"]
+                np.minimum(state_min, result["state_min"], out=state_min)
+                np.maximum(state_max, result["state_max"], out=state_max)
+
+            # --- Action stats ---
+            total_action_count += result["action_count"]
+            if action_sum is None:
+                action_sum = result["action_sum"].copy()
+                action_sum_sq = result["action_sum_sq"].copy()
+                action_min = result["action_min"].copy()
+                action_max = result["action_max"].copy()
+            else:
+                action_sum += result["action_sum"]
+                action_sum_sq += result["action_sum_sq"]
+                np.minimum(action_min, result["action_min"], out=action_min)
+                np.maximum(action_max, result["action_max"], out=action_max)
+
+            # --- Per-timestamp stats ---
+            if "pts_count" in result:
+                pts_count += result["pts_count"]
+                if pts_sum is None:
+                    pts_sum = result["pts_sum"].copy()
+                    pts_sum_sq = result["pts_sum_sq"].copy()
+                    pts_min = result["pts_min"].copy()
+                    pts_max = result["pts_max"].copy()
+                else:
+                    pts_sum += result["pts_sum"]
+                    pts_sum_sq += result["pts_sum_sq"]
+                    np.minimum(pts_min, result["pts_min"], out=pts_min)
+                    np.maximum(pts_max, result["pts_max"], out=pts_max)
+
+            # --- Reservoir sampling (pre-allocated array, no list growth) ---
+            if "reservoir" in result:
+                ep_res = result["reservoir"]  # (n, H, D) float32
+                for i in range(ep_res.shape[0]):
+                    reservoir_seen += 1
+                    if reservoir_filled < max_reservoir:
+                        reservoir_arr[reservoir_filled] = ep_res[i]
+                        reservoir_filled += 1
+                    else:
+                        j = rng_reservoir.randint(0, reservoir_seen)
+                        if j < max_reservoir:
+                            reservoir_arr[j] = ep_res[i]
+
+            num_processed += 1
+            if num_processed % 200 == 0:
+                elapsed = time.time() - t_processing_start
+                eps_per_sec = num_processed / elapsed
+                remaining = (len(episode_files) - num_processed) / eps_per_sec if eps_per_sec > 0 else 0
+                print(f"Processed {num_processed}/{len(episode_files)} episodes "
+                      f"({eps_per_sec:.1f} eps/sec, ~{remaining:.0f}s remaining, "
+                      f"reservoir: {reservoir_filled}/{max_reservoir})")
+
+    t_processing_end = time.time()
+    print(f"\nProcessed {num_processed} episodes in {t_processing_end - t_processing_start:.1f}s "
+          f"({num_processed / (t_processing_end - t_processing_start):.1f} eps/sec)")
+
+    if num_processed == 0:
+        raise RuntimeError("No episodes processed")
+
+    # Trim reservoir to actual size
+    reservoir_arr = reservoir_arr[:reservoir_filled]
+    print(f"Reservoir: {reservoir_filled:,} samples ({reservoir_arr.nbytes / 1024**2:.0f} MB)")
+
+    gc.collect()
+
+    # ====== Compute final statistics ======
+    print("\nComputing final statistics...")
+
+    state_mean = state_sum / total_state_count
+    state_var = (state_sum_sq / total_state_count) - state_mean**2
+    state_std = np.sqrt(np.maximum(0, state_var))
+
+    action_mean = action_sum / total_action_count
+    action_var = (action_sum_sq / total_action_count) - action_mean**2
+    action_std = np.sqrt(np.maximum(0, action_var))
+
+    # Quantiles from reservoir
+    if reservoir_filled > 0:
+        print(f"Computing quantiles from {reservoir_filled:,} reservoir samples...")
+        res_flat = reservoir_arr.reshape(-1, reservoir_arr.shape[-1])
+        action_q01 = np.percentile(res_flat, 1, axis=0)
+        action_q99 = np.percentile(res_flat, 99, axis=0)
+        print(f"  q01/q99 from {len(res_flat):,} data points")
+    else:
+        action_q01 = action_min
+        action_q99 = action_max
+
+    final_stats = {
+        "state": {"mean": state_mean, "std": state_std, "q01": state_min, "q99": state_max},
+        "actions": {"mean": action_mean, "std": action_std, "q01": action_q01, "q99": action_q99},
+    }
+
+    # ====== Per-timestamp statistics ======
+    per_timestamp_stats = None
+    if compute_per_timestamp and pts_count > 0:
+        pts_mean = pts_sum / pts_count
+        pts_var = (pts_sum_sq / pts_count) - pts_mean**2
+        pts_std_val = np.sqrt(np.maximum(0, pts_var))
+
+        if reservoir_filled > 0:
+            pts_q01 = np.percentile(reservoir_arr, 1, axis=0)
+            pts_q99 = np.percentile(reservoir_arr, 99, axis=0)
+        else:
+            pts_q01, pts_q99 = pts_min, pts_max
+
+        per_timestamp_stats = {
+            "per_timestamp_mean": pts_mean,
+            "per_timestamp_std": pts_std_val,
+            "per_timestamp_q01": pts_q01,
+            "per_timestamp_q99": pts_q99,
+        }
+
+    # ====== Correlation matrix (from reservoir, not streamed) ======
+    correlation_stats = None
+    if compute_correlation:
+        if reservoir_filled == 0:
+            raise RuntimeError("Correlation requested but reservoir is empty")
+
+        print(f"\nComputing correlation matrix from {reservoir_filled:,} reservoir samples...")
+        correlation_stats = compute_correlation_from_reservoir(
+            reservoir_arr, action_horizon, target_action_dim, max_correlation_samples
+        )
+
+    # Free reservoir
+    del reservoir_arr
+    gc.collect()
+
+    # ====== Build NormStats and save ======
     correlation_matrix = None
     if compute_correlation:
         if correlation_stats is None:
-            raise RuntimeError(
-                "Correlation computation was requested (--correlation) but correlation_stats is None. "
-                "This indicates an unexpected error in the correlation computation pipeline."
-            )
-        print("Adding action correlation matrix...")
+            raise RuntimeError("Correlation computation failed")
         chol_matrix = correlation_stats["action_correlation_cholesky"]
-        print(f"Correlation matrix shape: {chol_matrix.shape}")
-        
-        # Verify size matches expected (should already be correct from padding before computation)
-        expected_dim = action_horizon * config.model.action_dim
+        expected_dim = action_horizon * target_action_dim
         if chol_matrix.shape[0] != expected_dim:
             raise ValueError(
-                f"Correlation matrix has unexpected size {chol_matrix.shape[0]}, "
-                f"expected {expected_dim} (action_horizon={action_horizon} × action_dim={config.model.action_dim})"
-            )
-        
+                f"Correlation matrix size {chol_matrix.shape[0]} != expected {expected_dim}")
         correlation_matrix = chol_matrix
-    elif correlation_stats is not None:
-        # This shouldn't happen but handle it gracefully
-        print("WARNING: Correlation matrix was computed but --correlation flag was False. Ignoring correlation matrix.")
-    
-    # Create NormStats objects with proper structure
+
     norm_stats_dict = {}
-    
     for key in ["state", "actions"]:
-        # Prepare basic statistics
         stats_kwargs = {}
         for stat_type in ["mean", "std", "q01", "q99"]:
             stat_value = final_stats[key][stat_type]
-            padded_value = transforms.pad_to_dim(stat_value, config.model.action_dim)
-            stats_kwargs[stat_type] = padded_value
-        
-        # Add per-timestamp statistics if computed and this is actions
+            stats_kwargs[stat_type] = transforms.pad_to_dim(stat_value, target_action_dim)
+
         if per_timestamp_stats is not None and key == "actions":
             print("Adding per-timestamp statistics...")
             for stat_type in ["per_timestamp_mean", "per_timestamp_std", "per_timestamp_q01", "per_timestamp_q99"]:
                 stat_value = per_timestamp_stats[stat_type]
-                # Pad each timestamp to model action dimension
-                padded_value = []
-                for t in range(stat_value.shape[0]):
-                    padded_timestep = transforms.pad_to_dim(stat_value[t], config.model.action_dim)
-                    padded_value.append(padded_timestep)
-                stats_kwargs[stat_type] = np.array(padded_value)
-        
-        # Add correlation matrices if computed and this is actions
+                padded = np.array([transforms.pad_to_dim(stat_value[t], target_action_dim)
+                                   for t in range(stat_value.shape[0])])
+                stats_kwargs[stat_type] = padded
+
         if correlation_matrix is not None and key == "actions":
             stats_kwargs["action_correlation_cholesky"] = correlation_matrix
-            # Also add averaged spatial and temporal correlations if available
             if correlation_stats and "action_correlation_spatial" in correlation_stats:
                 stats_kwargs["action_correlation_spatial"] = correlation_stats["action_correlation_spatial"]
             if correlation_stats and "action_correlation_temporal" in correlation_stats:
                 stats_kwargs["action_correlation_temporal"] = correlation_stats["action_correlation_temporal"]
-        
-        # Create NormStats object
+
         norm_stats_dict[key] = normalize.NormStats(**stats_kwargs)
-    
-    # Save statistics
+
+    # Save
     output_path = config.assets_dirs / data_config.repo_id
     output_path.mkdir(parents=True, exist_ok=True)
     normalize.save(output_path, norm_stats_dict)
-    
-    # Print summary for verification
+
+    # Summary
+    t_end = time.time()
+    print(f"\n{'='*60}")
+    print(f"Total time: {t_end - t_start:.1f}s")
+    print(f"Processing: {t_processing_end - t_processing_start:.1f}s "
+          f"({num_processed / (t_processing_end - t_processing_start):.1f} eps/sec)")
+    print(f"{'='*60}")
+
     print("\nStatistics Summary (first 23 dims):")
     state_means = np.array(norm_stats_dict["state"].mean[:23])
     action_means = np.array(norm_stats_dict["actions"].mean[:23])
     differences = np.abs(state_means - action_means)
-    
     print("State means:  ", state_means)
     print("Action means: ", action_means)
-    print("Differences:  ", differences)
     print("Max difference:", np.max(differences))
-    print("\nNote: For actions, q01/q99 are actual percentiles. For state, q01/q99 contain min/max values.")
-    
+
     if per_timestamp_stats is not None:
-        print(f"\nPer-timestamp statistics computed for {action_horizon} timesteps")
-        # Show first few timesteps for verification
         per_ts_means = np.array(norm_stats_dict["actions"].per_timestamp_mean)
-        print(f"Per-timestamp means shape: {per_ts_means.shape}")
+        print(f"\nPer-timestamp means shape: {per_ts_means.shape}")
         print("First 3 timesteps, first 5 dims:")
         for t in range(min(3, per_ts_means.shape[0])):
             print(f"  t={t}: {per_ts_means[t, :5]}")
-    
+
     if compute_correlation:
-        print(f"\nCorrelation matrices computed!")
-        
-        # Full correlation matrix
-        corr_matrix = np.array(norm_stats_dict["actions"].action_correlation_cholesky)
-        print(f"  Full correlation (Cholesky): {corr_matrix.shape}")
-        print(f"    Memory: {corr_matrix.nbytes / 1024 / 1024:.2f} MB")
-        
-        # Averaged spatial correlation
-        if hasattr(norm_stats_dict["actions"], 'action_correlation_spatial') and \
-           norm_stats_dict["actions"].action_correlation_spatial is not None:
-            spatial = np.array(norm_stats_dict["actions"].action_correlation_spatial)
-            print(f"  Spatial (dim×dim, averaged): {spatial.shape}")
-            print(f"    Memory: {spatial.nbytes / 1024:.2f} KB")
-            print(f"    Sample correlation (d0 vs d1): {spatial[0, 1]:.4f}")
-        
-        # Averaged temporal correlation
-        if hasattr(norm_stats_dict["actions"], 'action_correlation_temporal') and \
-           norm_stats_dict["actions"].action_correlation_temporal is not None:
-            temporal = np.array(norm_stats_dict["actions"].action_correlation_temporal)
-            print(f"  Temporal (time×time, averaged): {temporal.shape}")
-            print(f"    Memory: {temporal.nbytes / 1024:.2f} KB")
-            print(f"    Sample correlation (t0 vs t1): {temporal[0, 1]:.4f}")
-        
-        print("\nNote: Beta shrinkage will be applied at model load time (not during stats computation)")
-    else:
-        print("\nCorrelation matrix computation was disabled (--no-correlation)")
-    
-    print(f"\nStatistics saved to: {output_path}")
+        print(f"\nCorrelation matrices:")
+        corr = np.array(norm_stats_dict["actions"].action_correlation_cholesky)
+        print(f"  Cholesky: {corr.shape} ({corr.nbytes / 1024**2:.2f} MB)")
+        if norm_stats_dict["actions"].action_correlation_spatial is not None:
+            s = np.array(norm_stats_dict["actions"].action_correlation_spatial)
+            print(f"  Spatial: {s.shape}, d0-d1 corr: {s[0, 1]:.4f}")
+        if norm_stats_dict["actions"].action_correlation_temporal is not None:
+            t = np.array(norm_stats_dict["actions"].action_correlation_temporal)
+            print(f"  Temporal: {t.shape}, t0-t1 corr: {t[0, 1]:.4f}")
+
+    print(f"\nSaved to: {output_path}")
 
 
 if __name__ == "__main__":
+    import tyro
     tyro.cli(main)
